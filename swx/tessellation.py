@@ -12,6 +12,8 @@ import numpy as np
 from .assembly import (
     Aabb,
     AssemblyInstance,
+    AssemblyScene,
+    SceneNode,
     assembly_from_streams,
     find_instance_name_markers,
     invert_rigid,
@@ -28,7 +30,22 @@ from .geometry import (
     stamp_mesh,
     transform_mesh,
 )
-from .inflate import index_of_ascii, index_of_seq
+from .inflate import index_of_seq
+from .textures import (
+    BindLook,
+    CadMapping,
+    CadPbr,
+    CadTexture,
+    TextureLook,
+    bind_appearance_textures,
+    extract_raster_images,
+    fill_tex_index,
+    intern_pbr,
+    mapping_length,
+    mapping_scale,
+    parse_texture_looks,
+    project_box_uvs,
+)
 
 FLT_HDR = bytes([0x0C, 0, 0, 0, 0x64, 0, 0, 0, 0x02, 0, 0, 0])
 INT_HDR = bytes([0x04, 0, 0, 0, 0x08, 0, 0, 0, 0x02, 0, 0, 0])
@@ -41,6 +58,16 @@ class SwAppearance:
     roughness: float
     name: str
     off: int | None = None
+    path: str | None = None
+    scale_u: float | None = None
+    scale_v: float | None = None
+    rotation_deg: float | None = None
+    bump_amount: float | None = None
+    origin: tuple[float, float, float] | None = None
+    axis_u: tuple[float, float, float] | None = None
+    axis_v: tuple[float, float, float] | None = None
+    map_type: int | None = None
+    pbr: CadPbr | None = None
 
 
 @dataclass
@@ -296,43 +323,62 @@ def collect_raw_vertex_blocks(data: bytes, from_: int = 0, until: int | None = N
     return faces
 
 
-def _merge_faces(
-    faces: Sequence[tuple[np.ndarray, np.ndarray | None, np.ndarray, tuple[float, float, float] | None]],
-    name: str,
-) -> ExtractedMesh | None:
+@dataclass
+class BuiltFace:
+    positions: np.ndarray
+    normals: np.ndarray | None
+    indices: np.ndarray
+    color: tuple[float, float, float] | None
+    uvs: np.ndarray | None = None
+    tex_index: int | None = None
+
+
+def _merge_faces(faces: Sequence[BuiltFace], name: str) -> ExtractedMesh | None:
     vert_count = 0
     index_total = 0
     has_c = False
-    for pos, _n, idx, color in faces:
-        vert_count += pos.size // 3
-        index_total += idx.size
-        if color:
+    has_uv = False
+    has_tex = False
+    for f in faces:
+        vert_count += f.positions.size // 3
+        index_total += f.indices.size
+        if f.color:
             has_c = True
+        if f.uvs is not None and f.uvs.size == (f.positions.size // 3) * 2:
+            has_uv = True
+        if f.tex_index is not None and f.tex_index >= 0:
+            has_tex = True
     if vert_count < 3 or index_total < 3:
         return None
     positions = np.empty(vert_count * 3, dtype=np.float32)
     normals = np.zeros(vert_count * 3, dtype=np.float32)
     indices = np.empty(index_total, dtype=np.uint32)
     colors = np.empty(vert_count * 3, dtype=np.float32) if has_c else None
+    uvs = np.zeros(vert_count * 2, dtype=np.float32) if has_uv else None
+    tex_index = np.full(vert_count, 0xFFFF, dtype=np.uint16) if has_tex else None
     v_base = 0
     i_base = 0
     has_nrm = False
     mesh_color: tuple[float, float, float] | None = None
-    for pos, nrm, idx, color in faces:
-        n = pos.size // 3
-        positions[v_base * 3 : (v_base + n) * 3] = pos
-        if nrm is not None:
-            normals[v_base * 3 : (v_base + n) * 3] = nrm
+    for face in faces:
+        n = face.positions.size // 3
+        positions[v_base * 3 : (v_base + n) * 3] = face.positions
+        if face.normals is not None:
+            normals[v_base * 3 : (v_base + n) * 3] = face.normals
             has_nrm = True
         if colors is not None:
-            c = color or DEFAULT_CAD_COLOR
-            if color and mesh_color is None:
-                mesh_color = color
+            c = face.color or DEFAULT_CAD_COLOR
+            if face.color and mesh_color is None:
+                mesh_color = face.color
             colors[v_base * 3 : (v_base + n) * 3 : 3] = c[0]
             colors[v_base * 3 + 1 : (v_base + n) * 3 : 3] = c[1]
             colors[v_base * 3 + 2 : (v_base + n) * 3 : 3] = c[2]
-        indices[i_base : i_base + idx.size] = idx + v_base
-        i_base += idx.size
+        if uvs is not None and face.uvs is not None and face.uvs.size == n * 2:
+            uvs[v_base * 2 : (v_base + n) * 2] = face.uvs
+        if tex_index is not None and face.tex_index is not None and face.tex_index >= 0:
+            tex_index[v_base : v_base + n] = face.tex_index
+        indices[i_base : i_base + face.indices.size] = face.indices + v_base
+        i_base += face.indices.size
         v_base += n
     return ExtractedMesh(
         positions=positions,
@@ -341,6 +387,8 @@ def _merge_faces(
         name=name,
         color=mesh_color,
         colors=colors,
+        uvs=uvs,
+        tex_index=tex_index,
     )
 
 
@@ -363,31 +411,126 @@ def _appearance_for_off(off: int, apps: list[SwAppearance]) -> SwAppearance | No
     return prev or nxt
 
 
+def _position_diag(faces: Sequence[FaceTess | _RawFace]) -> float:
+    mn = np.array([math.inf, math.inf, math.inf])
+    mx = np.array([-math.inf, -math.inf, -math.inf])
+    any_v = False
+    for f in faces:
+        p = f.positions.reshape(-1, 3)
+        if p.size == 0:
+            continue
+        any_v = True
+        mn = np.minimum(mn, p.min(axis=0))
+        mx = np.maximum(mx, p.max(axis=0))
+    if not any_v:
+        return 0.0
+    return float(np.linalg.norm(mx - mn))
+
+
+def _mapping_for_look(look: SwAppearance, diag: float) -> CadMapping:
+    origin = look.origin
+    return CadMapping(
+        scale_u=mapping_scale(look.scale_u if look.scale_u is not None else 0.1, diag),
+        scale_v=mapping_scale(look.scale_v if look.scale_v is not None else (look.scale_u if look.scale_u is not None else 0.1), diag),
+        rotation_deg=look.rotation_deg or 0.0,
+        origin=(
+            (
+                mapping_length(origin[0], diag),
+                mapping_length(origin[1], diag),
+                mapping_length(origin[2], diag),
+            )
+            if origin
+            else None
+        ),
+        axis_u=look.axis_u,
+        axis_v=look.axis_v,
+        map_type=look.map_type,
+    )
+
+
+def _appearance_to_bind(apps: list[SwAppearance]) -> list[BindLook]:
+    out: list[BindLook] = []
+    for a in apps:
+        out.append(
+            BindLook(
+                name=a.name,
+                color=a.color,
+                metalness=a.metalness,
+                roughness=a.roughness,
+                off=a.off,
+                path=a.path,
+                scale_u=a.scale_u,
+                scale_v=a.scale_v,
+                rotation_deg=a.rotation_deg,
+                bump_amount=a.bump_amount,
+                origin=a.origin,
+                axis_u=a.axis_u,
+                axis_v=a.axis_v,
+                map_type=a.map_type,
+                pbr=a.pbr,
+            )
+        )
+    return out
+
+
+def _sync_pbr_from_bind(apps: list[SwAppearance], binds: list[BindLook]) -> None:
+    for a, b in zip(apps, binds):
+        a.pbr = b.pbr
+        a.scale_u = b.scale_u
+        a.scale_v = b.scale_v
+        a.rotation_deg = b.rotation_deg
+        a.bump_amount = b.bump_amount
+        a.origin = b.origin
+        a.axis_u = b.axis_u
+        a.axis_v = b.axis_v
+        a.map_type = b.map_type
+        a.path = b.path
+
+
 def faces_to_mesh(
     data: bytes,
     from_: int,
     until: int,
     name: str,
     appearances: list[SwAppearance] | None = None,
+    catalog: list[CadTexture] | None = None,
+    materials: list[CadPbr] | None = None,
+    diag_hint: float = 0.2,
 ) -> ExtractedMesh | None:
     appearances = appearances or []
+    catalog = catalog or []
+    materials = materials or []
 
-    def decorate(
-        faces: Sequence[FaceTess | _RawFace],
-    ) -> list[tuple[np.ndarray, np.ndarray | None, int, tuple[float, float, float] | None]]:
-        out = []
+    def decorate(faces: Sequence[FaceTess | _RawFace]) -> list[BuiltFace]:
+        diag = _position_diag(faces) or diag_hint or 0.2
+        built: list[BuiltFace] = []
         for face in faces:
             look = _appearance_for_off(face.off, appearances)
-            out.append((face.positions, face.normals, face.off, look.color if look else None))
-        return out
+            uvs = None
+            tex_i = None
+            if look and look.pbr:
+                idx = intern_pbr(materials, look.pbr)
+                mapped = _mapping_for_look(look, diag)
+                uvs = project_box_uvs(face.positions, face.normals, mapped.scale_u, mapped.scale_v, mapped.rotation_deg, mapped)
+                tex_i = idx
+            built.append(
+                BuiltFace(
+                    positions=face.positions,
+                    normals=face.normals,
+                    indices=np.empty(0, dtype=np.uint32),
+                    color=look.color if look else None,
+                    uvs=uvs,
+                    tex_index=tex_i,
+                )
+            )
+        return built
 
     strip_faces = collect_strip_faces(data, from_, until)
     if strip_faces:
         decorated = decorate(strip_faces)
-        built = []
-        for (pos, nrm, _off, color), src in zip(decorated, strip_faces):
-            built.append((pos, nrm, triangulate_strips(src.positions, src.normals, src.strips), color))
-        mesh = _merge_faces(built, name)
+        for face, src in zip(decorated, strip_faces):
+            face.indices = triangulate_strips(src.positions, src.normals, src.strips)
+        mesh = _merge_faces(decorated, name)
         if mesh and mesh.indices.size >= 3:
             look = _appearance_for_off(from_, appearances) or _appearance_for_off(until, appearances)
             if look:
@@ -399,8 +542,7 @@ def faces_to_mesh(
     if not raw:
         return None
     decorated_raw = decorate(raw)
-    built = []
-    for (pos, nrm, _off, color), src in zip(decorated_raw, raw):
+    for face, src in zip(decorated_raw, raw):
         n = src.positions.size // 3
         strip_idx = triangulate_strips(src.positions, src.normals, [n])
         degenerates = max(0, n - 2 - strip_idx.size // 3)
@@ -409,8 +551,8 @@ def faces_to_mesh(
             planar = triangulate_face(src.positions, src.normals)
             if planar.size > strip_idx.size:
                 indices = planar
-        built.append((pos, nrm, indices, color))
-    mesh = _merge_faces(built, name)
+        face.indices = indices
+    mesh = _merge_faces(decorated_raw, name)
     if mesh:
         look = _appearance_for_off(from_, appearances)
         if look:
@@ -554,6 +696,23 @@ def parse_face_appearances(data: bytes) -> list[SwAppearance]:
             continue
         look = _look_from_name(name, (r / 255.0, g / 255.0, b / 255.0))
         look.off = i
+        base = after + 5
+        if base + 48 <= len(data):
+            ux, uy, uz, vx, vy, vz, ox, oy, oz = struct.unpack_from("<fffffffff", data, base)
+            map_type = struct.unpack_from("<i", data, base + 40)[0]
+            bump = struct.unpack_from("<f", data, base + 44)[0]
+            u_len = math.hypot(ux, uy, uz)
+            v_len = math.hypot(vx, vy, vz)
+            if 0.5 < u_len < 1.5 and 0.5 < v_len < 1.5:
+                look.axis_u = (ux / u_len, uy / u_len, uz / u_len)
+                look.axis_v = (vx / v_len, vy / v_len, vz / v_len)
+            o_len = math.hypot(ox, oy, oz)
+            if not (0.5 < o_len < 1.5) and 1e-6 < o_len < 20:
+                look.origin = (ox, oy, oz)
+            if look.axis_u and 0 <= map_type <= 5:
+                look.map_type = map_type
+            if 0 <= map_type <= 4 and math.isfinite(bump) and 0 <= bump <= 100:
+                look.bump_amount = bump / 100 if bump > 1.5 else bump
         out.append(look)
         i = after
     return out
@@ -715,7 +874,12 @@ def extract_by_instance_names(
     instances: list[AssemblyInstance],
     appearances: list[SwAppearance],
     part_bounds: dict[str, Aabb],
+    catalog: list[CadTexture] | None = None,
+    materials: list[CadPbr] | None = None,
+    prototypes_out: dict[str, ExtractedMesh] | None = None,
 ) -> ExtractedMesh | None:
+    catalog = catalog or []
+    materials = materials or []
     markers = find_instance_name_markers(display_lists)
     if not markers:
         return None
@@ -725,7 +889,7 @@ def extract_by_instance_names(
         end = markers[i + 1].off if i + 1 < len(markers) else len(display_lists)
         if end - start < 80:
             continue
-        mesh = faces_to_mesh(display_lists, start, end, marker.path, appearances)
+        mesh = faces_to_mesh(display_lists, start, end, marker.path, appearances, catalog, materials)
         if not mesh or mesh.indices.size < 3:
             continue
         inst = match_instance(marker.path, instances)
@@ -801,6 +965,10 @@ def extract_by_instance_names(
         if name not in proto_by_name:
             take_proto(name, mesh, inst)
 
+    if prototypes_out is not None:
+        for name, proto in proto_by_name.items():
+            prototypes_out.setdefault(name, proto)
+
     grouped: dict[str, list[AssemblyInstance]] = {}
     for inst in instances:
         grouped.setdefault(inst.name, []).append(inst)
@@ -827,16 +995,31 @@ def extract_display_tessellation(
     instance_xforms: list[list[float]] | None = None,
     instances: list[AssemblyInstance] | None = None,
     part_bounds: dict[str, Aabb] | None = None,
+    catalog: list[CadTexture] | None = None,
+    mapped: list[TextureLook] | None = None,
+    images: list[CadTexture] | None = None,
+    materials: list[CadPbr] | None = None,
+    prototypes_out: dict[str, ExtractedMesh] | None = None,
 ) -> ExtractedMesh | None:
     appearances = appearances or []
     instance_xforms = instance_xforms or []
     instances = instances or []
     part_bounds = part_bounds or {}
+    catalog = catalog or []
+    materials = materials or []
+    mapped = mapped or []
+    images = images or []
     local = parse_visual_properties(display_lists) + parse_face_appearances(display_lists)
     local.sort(key=lambda a: a.off or 0)
+    looks_mapped = list(mapped) + parse_texture_looks(display_lists)
+    binds = _appearance_to_bind(local)
+    bind_appearance_textures(binds, looks_mapped, images, catalog, materials)
+    _sync_pbr_from_bind(local, binds)
     looks = local or appearances
     if instances:
-        placed = extract_by_instance_names(display_lists, instances, looks, part_bounds)
+        placed = extract_by_instance_names(
+            display_lists, instances, looks, part_bounds, catalog, materials, prototypes_out
+        )
         if placed and placed.indices.size >= 3:
             return placed
 
@@ -852,7 +1035,7 @@ def extract_display_tessellation(
 
     parts: list[ExtractedMesh] = []
     for i, (start, end, xform) in enumerate(ranges):
-        mesh = faces_to_mesh(display_lists, start, end, name, looks)
+        mesh = faces_to_mesh(display_lists, start, end, name, looks, catalog, materials)
         if not mesh or mesh.indices.size < 3:
             continue
         if xform and not _is_identity(xform):
@@ -865,12 +1048,44 @@ def extract_display_tessellation(
                 mesh.roughness = look.roughness
                 if look.name:
                     mesh.name = look.name
+                if look.pbr and mesh.uvs is None:
+                    idx = intern_pbr(materials, look.pbr)
+                    box_mn, box_mx = bounding_box(mesh.positions)
+                    diag = float(np.linalg.norm(box_mx - box_mn))
+                    mapped_look = _mapping_for_look(look, diag)
+                    mesh.uvs = project_box_uvs(
+                        mesh.positions,
+                        mesh.normals,
+                        mapped_look.scale_u,
+                        mapped_look.scale_v,
+                        mapped_look.rotation_deg,
+                        mapped_look,
+                    )
+                    mesh.tex_index = fill_tex_index(mesh.positions.size // 3, idx)
         parts.append(mesh)
-    return merge_meshes(parts)
+    merged = merge_meshes(parts)
+    if merged and prototypes_out is not None and name not in prototypes_out:
+        prototypes_out[name] = merged
+    return merged
 
 
-def extract_best_tessellation(streams: dict[str, bytes], name: str) -> ExtractedMesh | None:
+@dataclass
+class ExtractedScene:
+    merged: ExtractedMesh | None
+    prototypes: dict[str, ExtractedMesh]
+    tree: SceneNode | None
+    textures: list[CadTexture]
+    materials: list[CadPbr]
+    instances: list[AssemblyInstance]
+    root_name: str
+
+
+def extract_scene(streams: dict[str, bytes], name: str) -> ExtractedScene:
+    catalog: list[CadTexture] = []
+    materials: list[CadPbr] = []
+    images = extract_raster_images(streams)
     appearances: list[SwAppearance] = []
+    mapped: list[TextureLook] = []
     for key, blob in streams.items():
         if len(blob) < 40 or len(blob) > 12_000_000:
             continue
@@ -879,7 +1094,13 @@ def extract_best_tessellation(streams: dict[str, bytes], name: str) -> Extracted
         appearances.extend(parse_visual_properties(blob))
         if len(blob) <= 4_000_000:
             appearances.extend(parse_face_appearances(blob))
-    instances, part_bounds = assembly_from_streams(streams)
+            mapped.extend(parse_texture_looks(blob))
+    binds = _appearance_to_bind(appearances)
+    bind_appearance_textures(binds, mapped, images, catalog, materials)
+    _sync_pbr_from_bind(appearances, binds)
+    asm = assembly_from_streams(streams)
+    instances = asm.instances
+    part_bounds = asm.part_bounds
     instance_xforms = [i.transform for i in instances]
 
     preferred: list[bytes] = []
@@ -897,18 +1118,51 @@ def extract_best_tessellation(streams: dict[str, bytes], name: str) -> Extracted
             rest.append(blob)
     rest.sort(key=len, reverse=True)
 
+    prototypes: dict[str, ExtractedMesh] = {}
     collected: list[ExtractedMesh] = []
     for buf in preferred:
-        mesh = extract_display_tessellation(buf, name, appearances, instance_xforms, instances, part_bounds)
+        mesh = extract_display_tessellation(
+            buf, name, appearances, instance_xforms, instances, part_bounds, catalog, mapped, images, materials, prototypes
+        )
         if mesh and mesh.indices.size >= 3:
             collected.append(mesh)
+    merged: ExtractedMesh | None
     if collected:
-        return merge_meshes(collected)
-    best: ExtractedMesh | None = None
-    for buf in rest:
-        mesh = extract_display_tessellation(buf, name, appearances, instance_xforms, instances, part_bounds)
-        if not mesh or mesh.indices.size < 3:
-            continue
-        if best is None or mesh.indices.size > best.indices.size:
-            best = mesh
-    return best
+        merged = merge_meshes(collected)
+    else:
+        best: ExtractedMesh | None = None
+        for buf in rest:
+            mesh = extract_display_tessellation(
+                buf, name, appearances, instance_xforms, instances, part_bounds, catalog, mapped, images, materials, prototypes
+            )
+            if not mesh or mesh.indices.size < 3:
+                continue
+            if best is None or mesh.indices.size > best.indices.size:
+                best = mesh
+        merged = best
+
+    if merged:
+        if catalog:
+            merged.textures = catalog
+        if materials:
+            merged.materials = materials
+    if not prototypes and merged:
+        prototypes[merged.name or name] = merged
+    for proto in prototypes.values():
+        if catalog:
+            proto.textures = catalog
+        if materials:
+            proto.materials = materials
+    return ExtractedScene(
+        merged=merged,
+        prototypes=prototypes,
+        tree=asm.tree,
+        textures=catalog,
+        materials=materials,
+        instances=instances,
+        root_name=asm.root_name or name,
+    )
+
+
+def extract_best_tessellation(streams: dict[str, bytes], name: str) -> ExtractedMesh | None:
+    return extract_scene(streams, name).merged

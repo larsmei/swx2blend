@@ -20,6 +20,10 @@ class ExtractedMesh:
     colors: np.ndarray | None = None
     metalness: float | None = None
     roughness: float | None = None
+    uvs: np.ndarray | None = None
+    tex_index: np.ndarray | None = None
+    textures: list | None = None
+    materials: list | None = None
 
 
 def compute_normals(positions: np.ndarray, indices: np.ndarray) -> np.ndarray:
@@ -147,10 +151,14 @@ def stamp_mesh(mesh: ExtractedMesh, transforms: Sequence[Sequence[float]]) -> Ex
     src_p = mesh.positions
     src_n = mesh.normals if mesh.normals is not None and mesh.normals.size == src_p.size else None
     src_c = mesh.colors if mesh.colors is not None and mesh.colors.size == src_p.size else None
+    src_uv = mesh.uvs if mesh.uvs is not None and mesh.uvs.size == n_v * 2 else None
+    src_tex = mesh.tex_index if mesh.tex_index is not None and mesh.tex_index.size == n_v else None
     src_i = mesh.indices
     positions = np.empty(n_v * 3 * k, dtype=np.float32)
     normals = np.empty(n_v * 3 * k, dtype=np.float32) if src_n is not None else None
     colors = np.empty(n_v * 3 * k, dtype=np.float32) if src_c is not None else None
+    uvs = np.empty(n_v * 2 * k, dtype=np.float32) if src_uv is not None else None
+    tex_index = np.empty(n_v * k, dtype=np.uint16) if src_tex is not None else None
     indices = np.empty(n_i * k, dtype=np.uint32)
     for t, m in enumerate(transforms):
         vo = t * n_v
@@ -177,6 +185,10 @@ def stamp_mesh(mesh: ExtractedMesh, transforms: Sequence[Sequence[float]]) -> Ex
                 normals[po : po + n_v * 3] = src_n
         if colors is not None and src_c is not None:
             colors[po : po + n_v * 3] = src_c
+        if uvs is not None and src_uv is not None:
+            uvs[vo * 2 : (vo + n_v) * 2] = src_uv
+        if tex_index is not None and src_tex is not None:
+            tex_index[vo : vo + n_v] = src_tex
         io = t * n_i
         det = 1.0 if len(m) < 16 else _det3(m)
         if det < 0:
@@ -187,7 +199,15 @@ def stamp_mesh(mesh: ExtractedMesh, transforms: Sequence[Sequence[float]]) -> Ex
             indices[io : io + n_i] = src_i
         else:
             indices[io : io + n_i] = src_i + vo
-    return replace(mesh, positions=positions, normals=normals, indices=indices, colors=colors)
+    return replace(
+        mesh,
+        positions=positions,
+        normals=normals,
+        indices=indices,
+        colors=colors,
+        uvs=uvs,
+        tex_index=tex_index,
+    )
 
 
 def merge_meshes(meshes: Sequence[ExtractedMesh]) -> ExtractedMesh | None:
@@ -203,9 +223,13 @@ def merge_meshes(meshes: Sequence[ExtractedMesh]) -> ExtractedMesh | None:
     i_count = sum(m.indices.size for m in usable)
     has_n = any(m.normals is not None and m.normals.size == m.positions.size for m in usable)
     has_c = any(m.colors is not None or m.color for m in usable)
+    has_uv = any(m.uvs is not None and m.uvs.size == (m.positions.size // 3) * 2 for m in usable)
+    has_tex = any(m.tex_index is not None and m.tex_index.size == m.positions.size // 3 for m in usable)
     positions = np.empty(v_count * 3, dtype=np.float32)
     normals = np.zeros(v_count * 3, dtype=np.float32) if has_n else None
     colors = np.empty(v_count * 3, dtype=np.float32) if has_c else None
+    uvs = np.zeros(v_count * 2, dtype=np.float32) if has_uv else None
+    tex_index = np.full(v_count, 0xFFFF, dtype=np.uint16) if has_tex else None
     indices = np.empty(i_count, dtype=np.uint32)
     vo = 0
     io = 0
@@ -222,11 +246,20 @@ def merge_meshes(meshes: Sequence[ExtractedMesh]) -> ExtractedMesh | None:
                 colors[vo * 3 : (vo + n) * 3 : 3] = c[0]
                 colors[vo * 3 + 1 : (vo + n) * 3 : 3] = c[1]
                 colors[vo * 3 + 2 : (vo + n) * 3 : 3] = c[2]
+        if uvs is not None and m.uvs is not None and m.uvs.size == n * 2:
+            uvs[vo * 2 : (vo + n) * 2] = m.uvs
+        if tex_index is not None:
+            if m.tex_index is not None and m.tex_index.size == n:
+                tex_index[vo : vo + n] = m.tex_index
+            else:
+                tex_index[vo : vo + n] = 0xFFFF
         indices[io : io + m.indices.size] = m.indices + vo
         io += m.indices.size
         vo += n
     metal = next((m.metalness for m in usable if m.metalness is not None), None)
     rough = next((m.roughness for m in usable if m.roughness is not None), None)
+    textures = next((m.textures for m in usable if m.textures), None)
+    materials = next((m.materials for m in usable if m.materials), None)
     return ExtractedMesh(
         positions=positions,
         normals=normals,
@@ -236,6 +269,10 @@ def merge_meshes(meshes: Sequence[ExtractedMesh]) -> ExtractedMesh | None:
         colors=colors,
         metalness=metal,
         roughness=rough,
+        uvs=uvs,
+        tex_index=tex_index,
+        textures=textures,
+        materials=materials,
     )
 
 
@@ -245,10 +282,14 @@ def weld_mesh(mesh: ExtractedMesh, tolerance: float | None = None) -> ExtractedM
     eps = tolerance if tolerance is not None else diag * 1e-6
     inv = 1.0 / max(eps, 1e-12)
     keep_color = mesh.colors is not None and mesh.colors.size == mesh.positions.size
+    keep_uv = mesh.uvs is not None and mesh.uvs.size == (mesh.positions.size // 3) * 2
+    keep_tex = mesh.tex_index is not None and mesh.tex_index.size == mesh.positions.size // 3
     table: dict[tuple[int, ...], int] = {}
     pos: list[float] = []
     nrm: list[float] = []
     col: list[float] = []
+    uv: list[float] = []
+    tex: list[int] = []
     remap = np.empty(mesh.positions.size // 3, dtype=np.uint32)
     n = remap.size
     for i in range(n):
@@ -259,6 +300,7 @@ def weld_mesh(mesh: ExtractedMesh, tolerance: float | None = None) -> ExtractedM
             rgb = (float(mesh.colors[i * 3]), float(mesh.colors[i * 3 + 1]), float(mesh.colors[i * 3 + 2]))
         else:
             rgb = mesh.color or DEFAULT_CAD_COLOR
+        tex_id = int(mesh.tex_index[i]) if keep_tex and mesh.tex_index is not None else 0
         if keep_color:
             key = (
                 round(x * inv),
@@ -267,9 +309,10 @@ def weld_mesh(mesh: ExtractedMesh, tolerance: float | None = None) -> ExtractedM
                 round(rgb[0] * 32),
                 round(rgb[1] * 32),
                 round(rgb[2] * 32),
+                tex_id,
             )
         else:
-            key = (round(x * inv), round(y * inv), round(z * inv))
+            key = (round(x * inv), round(y * inv), round(z * inv), tex_id)
         ident = table.get(key)
         if ident is None:
             ident = len(pos) // 3
@@ -285,6 +328,10 @@ def weld_mesh(mesh: ExtractedMesh, tolerance: float | None = None) -> ExtractedM
                 )
             if keep_color:
                 col.extend(rgb)
+            if keep_uv and mesh.uvs is not None:
+                uv.extend((float(mesh.uvs[i * 2]), float(mesh.uvs[i * 2 + 1])))
+            if keep_tex and mesh.tex_index is not None:
+                tex.append(int(mesh.tex_index[i]))
         remap[i] = ident
     out_i: list[int] = []
     for i in range(0, mesh.indices.size, 3):
@@ -303,6 +350,10 @@ def weld_mesh(mesh: ExtractedMesh, tolerance: float | None = None) -> ExtractedM
         colors=np.asarray(col, dtype=np.float32) if keep_color else mesh.colors,
         metalness=mesh.metalness,
         roughness=mesh.roughness,
+        uvs=np.asarray(uv, dtype=np.float32) if keep_uv else mesh.uvs,
+        tex_index=np.asarray(tex, dtype=np.uint16) if keep_tex else mesh.tex_index,
+        textures=mesh.textures,
+        materials=mesh.materials,
     )
 
 
@@ -353,12 +404,16 @@ def split_connected_bodies(mesh: ExtractedMesh) -> list[ExtractedMesh]:
         )
     has_n = mesh.normals is not None and mesh.normals.size == mesh.positions.size
     has_c = mesh.colors is not None and mesh.colors.size == mesh.positions.size
+    has_uv = mesh.uvs is not None and mesh.uvs.size == (mesh.positions.size // 3) * 2
+    has_tex = mesh.tex_index is not None and mesh.tex_index.size == mesh.positions.size // 3
     bodies: list[ExtractedMesh] = []
     for idx in groups.values():
         used: dict[int, int] = {}
         pos: list[float] = []
         nrm: list[float] = []
         col: list[float] = []
+        uv: list[float] = []
+        tex: list[int] = []
         remap: list[int] = []
         for old in idx:
             ident = used.get(old)
@@ -388,6 +443,10 @@ def split_connected_bodies(mesh: ExtractedMesh) -> list[ExtractedMesh]:
                             float(mesh.colors[old * 3 + 2]),
                         )
                     )
+                if has_uv and mesh.uvs is not None:
+                    uv.extend((float(mesh.uvs[old * 2]), float(mesh.uvs[old * 2 + 1])))
+                if has_tex and mesh.tex_index is not None:
+                    tex.append(int(mesh.tex_index[old]))
             remap.append(ident)
         if len(remap) < 3:
             continue
@@ -401,6 +460,8 @@ def split_connected_bodies(mesh: ExtractedMesh) -> list[ExtractedMesh]:
                 colors=np.asarray(col, dtype=np.float32) if has_c else None,
                 metalness=mesh.metalness,
                 roughness=mesh.roughness,
+                uvs=np.asarray(uv, dtype=np.float32) if has_uv else None,
+                tex_index=np.asarray(tex, dtype=np.uint16) if has_tex else None,
             )
         )
     bodies.sort(key=lambda b: b.indices.size, reverse=True)

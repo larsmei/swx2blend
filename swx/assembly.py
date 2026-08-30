@@ -41,9 +41,22 @@ class AssemblyInstance:
 
 
 @dataclass
-class NameMarker:
-    off: int
+class SceneNode:
+    name: str
     path: str
+    local_transform: list[float]
+    part: str | None
+    children: list["SceneNode"] = field(default_factory=list)
+    mirrored: bool = False
+
+
+@dataclass
+class AssemblyScene:
+    instances: list[AssemblyInstance]
+    part_bounds: dict[str, Aabb]
+    tree: SceneNode | None
+    root_name: str
+    models: list[AssemblyModel]
 
 
 def multiply4(a: Sequence[float], b: Sequence[float]) -> list[float]:
@@ -215,7 +228,58 @@ def flatten_assembly_instances(models: list[AssemblyModel]) -> list[AssemblyInst
     return leaves
 
 
-def assembly_from_streams(streams: dict[str, bytes]) -> tuple[list[AssemblyInstance], dict[str, Aabb]]:
+def build_assembly_tree(models: list[AssemblyModel]) -> SceneNode | None:
+    by_id = {m.id: m for m in models}
+    root = _find_root(models)
+    if not root:
+        return None
+
+    def walk(model: AssemblyModel, parent_path: str, depth: int) -> list[SceneNode]:
+        if depth > 24:
+            return []
+        nodes: list[SceneNode] = []
+        for ref in model.refs:
+            if ref.hidden:
+                continue
+            inst = f"{ref.name}-{ref.number}@{model.name}"
+            path = f"{parent_path}/{inst}" if parent_path else inst
+            child = by_id.get(ref.model_ref)
+            if child and child.refs:
+                node = SceneNode(
+                    name=ref.name,
+                    path=path,
+                    local_transform=ref.transform,
+                    part=None,
+                    children=walk(child, path, depth + 1),
+                    mirrored=det3of4(ref.transform) < 0,
+                )
+            else:
+                node = SceneNode(
+                    name=ref.name,
+                    path=path,
+                    local_transform=ref.transform,
+                    part=ref.name,
+                    children=[],
+                    mirrored=det3of4(ref.transform) < 0,
+                )
+            nodes.append(node)
+        return nodes
+
+    children = walk(root, "", 0)
+    if not children:
+        return None
+    return SceneNode(
+        name=root.name or "Assembly",
+        path=root.name or "Assembly",
+        local_transform=IDENTITY_4[:],
+        part=None,
+        children=children,
+        mirrored=False,
+    )
+
+
+def assembly_from_streams(streams: dict[str, bytes]) -> AssemblyScene:
+    empty = AssemblyScene(instances=[], part_bounds={}, tree=None, root_name="", models=[])
     for key, blob in streams.items():
         if "compinstance" not in key.lower():
             continue
@@ -223,8 +287,32 @@ def assembly_from_streams(streams: dict[str, bytes]) -> tuple[list[AssemblyInsta
         if "swTransform=" not in xml and "swtransform=" not in xml.lower():
             continue
         models = parse_comp_instance_tree(xml)
-        return flatten_assembly_instances(models), part_bounds_from_models(models)
-    return [], {}
+        tree = build_assembly_tree(models)
+        return AssemblyScene(
+            instances=flatten_assembly_instances(models),
+            part_bounds=part_bounds_from_models(models),
+            tree=tree,
+            root_name=tree.name if tree else "",
+            models=models,
+        )
+    return empty
+
+
+@dataclass
+class NameMarker:
+    off: int
+    path: str
+
+
+def scale_tree_translations(node: SceneNode, scale: float) -> None:
+    if scale == 1.0:
+        return
+    t = node.local_transform
+    t[12] *= scale
+    t[13] *= scale
+    t[14] *= scale
+    for child in node.children:
+        scale_tree_translations(child, scale)
 
 
 def canonicalize_instance_path(path: str) -> str:
