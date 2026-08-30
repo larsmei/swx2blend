@@ -1,0 +1,13 @@
+schema_version = "1.0.0"
+
+id = "swx2blend"
+version = "1.0.0"
+name = "swx2blend"
+tagline = "Import SolidWorks .sldprt and .sldasm files"
+maintainer = "larsmei"
+type = "add-on"
+website = "https://github.com/larsmei/swx2blend"
+tags = ["Import-Export"]
+blender_version_min = "4.2.0"
+license = ["SPDX:MIT"]
+copyright = ["2026 larsmei"]
